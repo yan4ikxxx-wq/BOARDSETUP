@@ -2,34 +2,39 @@ import os
 import hmac
 import hashlib
 import uuid
-import psycopg2
+import sqlite3
 from fastapi import FastAPI, Request, HTTPException, Header, status
 from pydantic import BaseModel
 from typing import Optional
 
 app = FastAPI(title="Paddle License Server Pro")
 
-# --- ---
+# Считываем секретный ключ из настроек Render (Notification Setting ID)
 PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "default_secret_for_testing_only")
+
+# Считываем URL базы данных PostgreSQL из настроек Render
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# SQL: %s Postgres, ? SQLite
-DB_PLACEHOLDER = "%s" if DATABASE_URL else "?"
-
 def get_db_connection():
-    """ (PostgreSQL SQLite )"""
+    """
+    Универсальное подключение: если есть DATABASE_URL — подключается к PostgreSQL,
+    если нет — использует локальный SQLite (для тестов на компьютере).
+    """
     if DATABASE_URL:
+        # Если мы в облаке Render, используем PostgreSQL
+        import psycopg2
         return psycopg2.connect(DATABASE_URL)
     else:
-        import sqlite3
+        # Если мы запускаем локально, используем SQLite
         return sqlite3.connect("licenses_local.db")
 
 def init_db():
-    """ """
+    """Создает таблицу лицензий, если её ещё нет"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("""
+    # Текст запроса (подходит и для SQLite, и для PostgreSQL)
+    query = """
         CREATE TABLE IF NOT EXISTS licenses (
             license_key TEXT PRIMARY KEY,
             customer_id TEXT,
@@ -38,21 +43,20 @@ def init_db():
             status TEXT DEFAULT 'active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
-
+    """
+    cursor.execute(query)
     conn.commit()
-    cursor.close()
     conn.close()
 
 
-#
+# Инициализируем базу данных при старте
 init_db()
 
 class LicenseVerifyRequest(BaseModel):
     license_key: str
 
 def verify_paddle_signature(request_body: bytes, signature_header: str) -> bool:
-    """ Paddle v2"""
+    """Проверка подлинности запроса от Paddle v2"""
     if not signature_header or ":" not in signature_header:
         return False
     try:
@@ -82,11 +86,13 @@ def read_root():
 async def handle_paddle_webhook(request: Request, paddle_signature: Optional[str] = Header(None)):
     body_bytes = await request.body()
 
+    # Если секрет настроен, строго проверяем подпись Paddle
     if PADDLE_WEBHOOK_SECRET != "default_secret_for_testing_only":
         if not paddle_signature or not verify_paddle_signature(body_bytes, paddle_signature):
+            print("[WARNING] Invalid Paddle signature rejected.")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid Paddle signature. Access denied."
+                detail="Invalid Paddle signature."
             )
 
     try:
@@ -105,29 +111,35 @@ async def handle_paddle_webhook(request: Request, paddle_signature: Optional[str
         if "customer" in data and data["customer"]:
             customer_email = data["customer"].get("email", "unknown")
 
+        # Генерируем уникальный лицензионный ключ
         license_key = f"KEY-{uuid.uuid4().hex.upper()}"
 
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-            # DB_PLACEHOLDER
-            query = f"INSERT INTO licenses (license_key, customer_id, customer_email, transaction_id) VALUES ({DB_PLACEHOLDER}, {DB_PLACEHOLDER}, {DB_PLACEHOLDER}, {DB_PLACEHOLDER})"
+
+            # Используем универсальный плейсхолдер %s для обеих БД
+            query = "INSERT INTO licenses (license_key, customer_id, customer_email, transaction_id) VALUES (%s, %s, %s, %s)"
+
+            # Маленький фикс для SQLite, так как он не понимает %s по умолчанию
+            if not DATABASE_URL:
+                query = query.replace("%s", "?")
+
             cursor.execute(query, (license_key, customer_id, customer_email, transaction_id))
             conn.commit()
-            cursor.close()
             conn.close()
             print(f"[SUCCESS] Generated license {license_key} for {customer_email}")
         except Exception as e:
-            return {"status": "ignored", "reason": "Database conflict or license already exists", "error": str(e)}
+            print(f"[ERROR] Database error: {e}")
+            return {"status": "error", "reason": str(e)}
 
         return {
             "status": "success",
-            "event": event_type,
             "license_key": license_key,
             "customer_email": customer_email
         }
 
-    return {"status": "ignored", "reason": f"Event type '{event_type}' is not handled"}
+    return {"status": "ignored", "reason": f"Event type '{event_type}' not handled"}
 
 @app.post("/verify-license")
 async def verify_license(payload: LicenseVerifyRequest):
@@ -135,11 +147,13 @@ async def verify_license(payload: LicenseVerifyRequest):
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    # DB_PLACEHOLDER
-    query = f"SELECT customer_email, status, created_at FROM licenses WHERE license_key = {DB_PLACEHOLDER}"
+
+    query = "SELECT customer_email, status, created_at FROM licenses WHERE license_key = %s"
+    if not DATABASE_URL:
+        query = query.replace("%s", "?")
+
     cursor.execute(query, (user_key,))
     row = cursor.fetchone()
-    cursor.close()
     conn.close()
 
     if row:
@@ -148,18 +162,8 @@ async def verify_license(payload: LicenseVerifyRequest):
             return {
                 "valid": True,
                 "status": "active",
-                "customer_email": email,
-                "activated_at": str(created_at)
+                "customer_email": email
             }
-        else:
-            return {
-                "valid": False,
-                "status": status_val,
-                "error": f"This license key is {status_val}"
-            }
+        return {"valid": False, "status": status_val}
 
-    return {
-        "valid": False,
-        "status": "not_found",
-        "error": "The provided license key does not exist"
-    }
+    return {"valid": False, "status": "not_found"}
