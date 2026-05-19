@@ -2,7 +2,7 @@ import os
 import hmac
 import hashlib
 import uuid
-import sqlite3
+import psycopg2
 from fastapi import FastAPI, Request, HTTPException, Header, status
 from pydantic import BaseModel
 from typing import Optional
@@ -10,17 +10,25 @@ from typing import Optional
 app = FastAPI(title="Paddle License Server Pro")
 
 # --- ---
-# Paddle: Developer -> Webhooks -> Secret key
-# Render "Environment Variables" PADDLE_WEBHOOK_SECRET
 PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "default_secret_for_testing_only")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# (SQLite Python, )
-DB_FILE = "licenses.db"
+# SQL: %s Postgres, ? SQLite
+DB_PLACEHOLDER = "%s" if DATABASE_URL else "?"
+
+def get_db_connection():
+    """ (PostgreSQL SQLite )"""
+    if DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL)
+    else:
+        import sqlite3
+        return sqlite3.connect("licenses_local.db")
 
 def init_db():
     """ """
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             license_key TEXT PRIMARY KEY,
@@ -31,28 +39,23 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
     conn.commit()
+    cursor.close()
     conn.close()
 
 
 #
 init_db()
 
-# --- ---
 class LicenseVerifyRequest(BaseModel):
     license_key: str
 
-# --- ---
 def verify_paddle_signature(request_body: bytes, signature_header: str) -> bool:
-    """
-        Paddle v2.
-          .
-    """
+    """ Paddle v2"""
     if not signature_header or ":" not in signature_header:
         return False
-
     try:
-        # Paddle-Signature : t=1672531199;h=sha256;v1=_
         parts = dict(item.split("=") for item in signature_header.split(";"))
         timestamp = parts.get("t")
         paddle_hash = parts.get("v1")
@@ -60,37 +63,25 @@ def verify_paddle_signature(request_body: bytes, signature_header: str) -> bool:
         if not timestamp or not paddle_hash:
             return False
 
-        # , Paddle v2
         signed_payload = f"{timestamp}:{request_body.decode('utf-8')}"
-
-        #
         computed_hash = hmac.new(
             PADDLE_WEBHOOK_SECRET.encode("utf-8"),
             signed_payload.encode("utf-8"),
             hashlib.sha256
         ).hexdigest()
 
-        # ( )
         return hmac.compare_digest(computed_hash, paddle_hash)
     except Exception:
         return False
-
-# --- ( ) ---
 
 @app.get("/")
 def read_root():
     return {"status": "online", "message": "Paddle License Server is running like a pro."}
 
-
 @app.post("/paddle-webhook")
 async def handle_paddle_webhook(request: Request, paddle_signature: Optional[str] = Header(None)):
-    """
-       Paddle. .
-    """
-    # 1.
     body_bytes = await request.body()
 
-    # 2. ( , )
     if PADDLE_WEBHOOK_SECRET != "default_secret_for_testing_only":
         if not paddle_signature or not verify_paddle_signature(body_bytes, paddle_signature):
             raise HTTPException(
@@ -98,7 +89,6 @@ async def handle_paddle_webhook(request: Request, paddle_signature: Optional[str
                 detail="Invalid Paddle signature. Access denied."
             )
 
-    # 3.
     try:
         payload = await request.json()
     except Exception:
@@ -106,35 +96,29 @@ async def handle_paddle_webhook(request: Request, paddle_signature: Optional[str
 
     event_type = payload.get("event_type")
 
-    #
     if event_type == "transaction.completed":
         data = payload.get("data", {})
-
         transaction_id = data.get("id")
         customer_id = data.get("customer_id")
 
-        # email Paddle v2
         customer_email = "unknown"
         if "customer" in data and data["customer"]:
             customer_email = data["customer"].get("email", "unknown")
 
-        # (: KEY-A1B2C3D4...)
         license_key = f"KEY-{uuid.uuid4().hex.upper()}"
 
-        # SQLite
         try:
-            conn = sqlite3.connect(DB_FILE)
+            conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO licenses (license_key, customer_id, customer_email, transaction_id) VALUES (?, ?, ?, ?)",
-                (license_key, customer_id, customer_email, transaction_id)
-            )
+            # DB_PLACEHOLDER
+            query = f"INSERT INTO licenses (license_key, customer_id, customer_email, transaction_id) VALUES ({DB_PLACEHOLDER}, {DB_PLACEHOLDER}, {DB_PLACEHOLDER}, {DB_PLACEHOLDER})"
+            cursor.execute(query, (license_key, customer_id, customer_email, transaction_id))
             conn.commit()
+            cursor.close()
             conn.close()
             print(f"[SUCCESS] Generated license {license_key} for {customer_email}")
-        except sqlite3.IntegrityError:
-            # ( Paddle )
-            return {"status": "ignored", "reason": "License already exists for this transaction"}
+        except Exception as e:
+            return {"status": "ignored", "reason": "Database conflict or license already exists", "error": str(e)}
 
         return {
             "status": "success",
@@ -145,21 +129,17 @@ async def handle_paddle_webhook(request: Request, paddle_signature: Optional[str
 
     return {"status": "ignored", "reason": f"Event type '{event_type}' is not handled"}
 
-
 @app.post("/verify-license")
 async def verify_license(payload: LicenseVerifyRequest):
-    """
-    , .
-    """
     user_key = payload.license_key.strip()
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT customer_email, status, created_at FROM licenses WHERE license_key = ?",
-        (user_key,)
-    )
+    # DB_PLACEHOLDER
+    query = f"SELECT customer_email, status, created_at FROM licenses WHERE license_key = {DB_PLACEHOLDER}"
+    cursor.execute(query, (user_key,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
 
     if row:
@@ -169,7 +149,7 @@ async def verify_license(payload: LicenseVerifyRequest):
                 "valid": True,
                 "status": "active",
                 "customer_email": email,
-                "activated_at": created_at
+                "activated_at": str(created_at)
             }
         else:
             return {
